@@ -133,17 +133,61 @@ def fetch_source(url: str) -> list[str]:
     return rules
 
 
-def read_local_rules(path: Path) -> list[str]:
+def read_local_rules(path: Path, *, allow_empty: bool = False) -> list[str]:
     try:
         rules = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
         raise RuntimeError(f"Cannot read local rules file {path}: {exc}") from exc
     if not rules or not any(line.strip() for line in rules):
+        if allow_empty:
+            return []
         raise ValueError(f"Local rules file is empty: {path}")
     if any("\n" in line or "\r" in line for line in rules):
         raise ValueError(f"Local rules file contains multiline entries: {path}")
     validate_filter_lines(rules)
     return rules
+
+
+def _contains_conditional_directives(rules: list[str]) -> bool:
+    return any(
+        line.strip().lower().startswith(("!#if", "!#endif"))
+        for line in rules
+    )
+
+
+def _is_contiguous_subsequence(needle: list[str], haystack: list[str]) -> bool:
+    return any(
+        haystack[index : index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def merge_user_rules(existing: list[str], additions: list[str]) -> list[str]:
+    """Persist staged additions once without deduping across conditional scopes."""
+    if not additions:
+        return list(existing)
+    validate_filter_lines(existing)
+    validate_filter_lines(additions)
+    if not _contains_conditional_directives(existing + additions):
+        merged: list[str] = []
+        seen: set[str] = set()
+        for line in existing + additions:
+            if not line.strip() or line in seen:
+                continue
+            seen.add(line)
+            merged.append(line)
+        return merged
+
+    # Keep a conditional addition as a source-scoped block. On repeat runs its
+    # exact contiguous occurrence identifies that it has already been merged.
+    if _is_contiguous_subsequence(additions, existing):
+        return list(existing)
+    overlap = 0
+    for size in range(min(len(existing), len(additions)), 0, -1):
+        if existing[-size:] == additions[:size]:
+            overlap = size
+            break
+    return existing + additions[overlap:]
 
 
 def merge_sources(
@@ -184,6 +228,25 @@ def merge_sources(
     return merged
 
 
+def update_rule_files(
+    user_rules_path: Path,
+    new_rules_path: Path,
+    output_path: Path,
+    urls: list[str],
+    fetch=fetch_source,
+) -> list[str]:
+    original_user_rules = read_local_rules(user_rules_path)
+    new_rules = read_local_rules(new_rules_path, allow_empty=True)
+    updated_user_rules = merge_user_rules(original_user_rules, new_rules)
+    # Fetch and validate every subscription before touching either persistent
+    # output, so a source failure cannot partially apply the pending additions.
+    merged = merge_sources(urls, fetch=fetch, local_rules=updated_user_rules)
+    if updated_user_rules != original_user_rules:
+        atomic_write(user_rules_path, updated_user_rules)
+    atomic_write(output_path, merged)
+    return merged
+
+
 def atomic_write(output: Path, rules: list[str]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = ("\n".join(rules) + "\n").encode("utf-8")
@@ -207,11 +270,16 @@ def main() -> int:
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--user-rules", type=Path, default=ROOT / "user_rules.txt")
+    parser.add_argument("--new-rules", type=Path, default=ROOT / "new_rules.txt")
     args = parser.parse_args()
     try:
-        local_rules = read_local_rules(args.user_rules)
-        rules = merge_sources(read_sources(args.sources), local_rules=local_rules)
-        atomic_write(args.output, rules)
+        urls = read_sources(args.sources)
+        rules = update_rule_files(
+            args.user_rules,
+            args.new_rules,
+            args.output,
+            urls,
+        )
     except Exception as exc:
         parser.exit(1, f"error: {exc}\n")
     print(f"Wrote {len(rules)} unique lines to {args.output}")
