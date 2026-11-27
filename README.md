@@ -7,8 +7,11 @@ Exact duplicate non-empty lines are removed without rewriting rule semantics.
 
 `user_rules.txt` contains only the `user_rules` list extracted from the local
 AdGuardHome configuration. The rest of that configuration is not included.
-Add rules to `new_rules.txt` to persist them into `user_rules.txt`. The file is
-never cleared; repeated runs are idempotent and retain the pending entries.
+Add pending rules to `new_rules.txt`. After subscriptions validate and both
+output files are written successfully, the queue is cleared only if its contents
+have not changed since processing began. Failed downloads/writes leave pending
+rules available for retry; concurrent edits are preserved and should be merged
+on the next run. Exact duplicates are idempotent.
 
 Run locally with Python 3.10+:
 
@@ -18,9 +21,12 @@ python merge_rules.py
 python -m unittest discover -s tests
 ```
 
-Every subscription must download and contain rules for an update to be written.
-The generated outputs are replaced atomically only after all subscriptions
-succeed. Filter directives are preserved only when they can be safely flattened.
+Every subscription must download and contain rules before output updates begin.
+Each generated output is replaced atomically; the input queue is cleared only
+after both output writes succeed and its snapshot is still unchanged. If the
+`rules.txt` write fails after updating `user_rules.txt`, the pending input stays
+in place and a retry safely deduplicates it. Filter directives are preserved
+only when they can be safely flattened.
 
 Conditional blocks are checked for balance and preserved without deduplication.
 Source-relative `!#include` directives and unknown bracketed sections are
@@ -30,3 +36,4 @@ YAML filters are parsed with PyYAML rather than interpreted as Python literals.
 
 GitHub Actions runs every Monday and Thursday at 02:00 UTC and can also be
 started manually. It commits changed `user_rules.txt` and `rules.txt`.
+It also commits `new_rules.txt` when a successful run clears its queued entries.

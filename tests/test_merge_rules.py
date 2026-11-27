@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import merge_rules
 
 
@@ -81,7 +82,7 @@ class MergeRulesTests(unittest.TestCase):
             path.write_text("\n".join(expected) + "\n", encoding="utf-8")
             self.assertEqual(merge_rules.read_local_rules(path), expected)
 
-    def test_empty_new_rules_file_is_kept_and_does_not_change_user_rules(self):
+    def test_empty_new_rules_file_stays_empty_and_does_not_change_user_rules(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             user = root / "user_rules.txt"
@@ -128,7 +129,7 @@ class MergeRulesTests(unittest.TestCase):
 
             self.assertEqual(user.read_bytes(), first_user)
             self.assertEqual(output.read_bytes(), first_output)
-            self.assertEqual(new.read_text(encoding="utf-8"), new_content)
+            self.assertEqual(new.read_bytes(), b"")
             self.assertEqual(
                 user.read_text(encoding="utf-8").splitlines(),
                 [
@@ -153,6 +154,7 @@ class MergeRulesTests(unittest.TestCase):
             fetch = lambda _: []
 
             merge_rules.update_rule_files(user, new, output, [], fetch=fetch)
+            self.assertEqual(new.read_bytes(), b"")
             new.write_text("||version-two.example^\n", encoding="utf-8")
             merge_rules.update_rule_files(user, new, output, [], fetch=fetch)
 
@@ -164,7 +166,7 @@ class MergeRulesTests(unittest.TestCase):
                     "||version-two.example^",
                 ],
             )
-            self.assertEqual(new.read_text(encoding="utf-8"), "||version-two.example^\n")
+            self.assertEqual(new.read_bytes(), b"")
 
     def test_conditional_new_rules_are_preserved_once_across_repeated_runs(self):
         additions = ["!#if A", "||conditional.example^", "!#endif"]
@@ -191,7 +193,7 @@ class MergeRulesTests(unittest.TestCase):
 
             self.assertEqual(user.read_bytes(), first_user)
             self.assertEqual(output.read_bytes(), first_output)
-            self.assertEqual(new.read_text(encoding="utf-8").splitlines(), additions)
+            self.assertEqual(new.read_bytes(), b"")
             self.assertEqual(output.read_text(encoding="utf-8").splitlines().count(
                 "||conditional.example^"
             ), 2)
@@ -216,6 +218,125 @@ class MergeRulesTests(unittest.TestCase):
             self.assertEqual(
                 (user.read_bytes(), new.read_bytes(), output.read_bytes()),
                 originals,
+            )
+
+    def test_new_rules_changed_during_download_aborts_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user = root / "user_rules.txt"
+            new = root / "new_rules.txt"
+            output = root / "rules.txt"
+            user.write_text("||base.example^\n", encoding="utf-8")
+            new.write_text("||first.example^\n", encoding="utf-8")
+            output.write_text("old output\n", encoding="utf-8")
+
+            def edit_new_rules(_):
+                new.write_text(
+                    "||first.example^\n||concurrent.example^\n",
+                    encoding="utf-8",
+                )
+                return ["||feed.example^"]
+
+            with self.assertRaisesRegex(RuntimeError, "changed during update"):
+                merge_rules.update_rule_files(
+                    user, new, output, ["feed"], fetch=edit_new_rules
+                )
+
+            self.assertEqual(user.read_text(encoding="utf-8"), "||base.example^\n")
+            self.assertEqual(
+                new.read_text(encoding="utf-8"),
+                "||first.example^\n||concurrent.example^\n",
+            )
+            self.assertEqual(output.read_text(encoding="utf-8"), "old output\n")
+
+    def test_new_rules_changed_before_clear_is_preserved_for_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user = root / "user_rules.txt"
+            new = root / "new_rules.txt"
+            output = root / "rules.txt"
+            user.write_text("||base.example^\n", encoding="utf-8")
+            new.write_text("||first.example^\n", encoding="utf-8")
+            original_atomic_write = merge_rules.atomic_write
+
+            def edit_after_output(path, rules):
+                original_atomic_write(path, rules)
+                if path == output:
+                    with new.open("a", encoding="utf-8", newline="\n") as stream:
+                        stream.write("||concurrent.example^\n")
+
+            with patch.object(merge_rules, "atomic_write", side_effect=edit_after_output):
+                with self.assertRaisesRegex(RuntimeError, "input was preserved"):
+                    merge_rules.update_rule_files(
+                        user, new, output, [], fetch=lambda _: []
+                    )
+
+            self.assertEqual(
+                new.read_text(encoding="utf-8"),
+                "||first.example^\n||concurrent.example^\n",
+            )
+            self.assertIn("||first.example^", user.read_text(encoding="utf-8"))
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "||base.example^\n||first.example^\n",
+            )
+
+    def test_user_rules_write_failure_keeps_new_rules_and_old_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user = root / "user_rules.txt"
+            new = root / "new_rules.txt"
+            output = root / "rules.txt"
+            user.write_text("||base.example^\n", encoding="utf-8")
+            new.write_text("||pending.example^\n", encoding="utf-8")
+            output.write_text("old output\n", encoding="utf-8")
+            original_atomic_write = merge_rules.atomic_write
+
+            def fail_user_write(path, rules):
+                if path == user:
+                    raise OSError("simulated user_rules write failure")
+                original_atomic_write(path, rules)
+
+            with patch.object(merge_rules, "atomic_write", side_effect=fail_user_write):
+                with self.assertRaisesRegex(OSError, "user_rules write failure"):
+                    merge_rules.update_rule_files(
+                        user, new, output, [], fetch=lambda _: []
+                    )
+
+            self.assertEqual(user.read_text(encoding="utf-8"), "||base.example^\n")
+            self.assertEqual(new.read_text(encoding="utf-8"), "||pending.example^\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), "old output\n")
+
+    def test_rules_write_failure_persists_addition_and_keeps_queue_for_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user = root / "user_rules.txt"
+            new = root / "new_rules.txt"
+            output = root / "rules.txt"
+            user.write_text("||base.example^\n", encoding="utf-8")
+            new.write_text("||pending.example^\n", encoding="utf-8")
+            output.write_text("old output\n", encoding="utf-8")
+            original_atomic_write = merge_rules.atomic_write
+
+            def fail_output_write(path, rules):
+                if path == output:
+                    raise OSError("simulated rules write failure")
+                original_atomic_write(path, rules)
+
+            with patch.object(merge_rules, "atomic_write", side_effect=fail_output_write):
+                with self.assertRaisesRegex(OSError, "rules write failure"):
+                    merge_rules.update_rule_files(
+                        user, new, output, [], fetch=lambda _: []
+                    )
+
+            self.assertIn("||pending.example^", user.read_text(encoding="utf-8"))
+            self.assertEqual(new.read_text(encoding="utf-8"), "||pending.example^\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), "old output\n")
+            merge_rules.update_rule_files(user, new, output, [], fetch=lambda _: [])
+            self.assertEqual(new.read_bytes(), b"")
+            self.assertEqual(
+                user.read_text(encoding="utf-8").splitlines().count("||pending.example^"),
+                1,
             )
 
     def test_rejects_unbalanced_conditionals_and_source_relative_includes(self):

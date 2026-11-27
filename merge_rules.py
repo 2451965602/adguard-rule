@@ -133,19 +133,114 @@ def fetch_source(url: str) -> list[str]:
     return rules
 
 
-def read_local_rules(path: Path, *, allow_empty: bool = False) -> list[str]:
+def _read_rules_snapshot(path: Path, *, allow_empty: bool = False) -> tuple[list[str], bytes]:
     try:
-        rules = path.read_text(encoding="utf-8-sig").splitlines()
+        content = path.read_bytes()
     except OSError as exc:
         raise RuntimeError(f"Cannot read local rules file {path}: {exc}") from exc
+    try:
+        rules = content.decode("utf-8-sig").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Local rules file is not valid UTF-8: {path}") from exc
     if not rules or not any(line.strip() for line in rules):
         if allow_empty:
-            return []
+            return [], content
         raise ValueError(f"Local rules file is empty: {path}")
     if any("\n" in line or "\r" in line for line in rules):
         raise ValueError(f"Local rules file contains multiline entries: {path}")
     validate_filter_lines(rules)
+    return rules, content
+
+
+def read_local_rules(path: Path, *, allow_empty: bool = False) -> list[str]:
+    rules, _ = _read_rules_snapshot(path, allow_empty=allow_empty)
     return rules
+
+
+def _ensure_unchanged(path: Path, expected: bytes) -> None:
+    try:
+        current = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot recheck local rules file {path}: {exc}") from exc
+    if current != expected:
+        raise RuntimeError(
+            f"Local rules file changed during update; no output written: {path}"
+        )
+
+
+def _open_exclusive_file(path: Path):
+    """Open for update while excluding concurrent writers where the OS permits."""
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0xC0000000,  # GENERIC_READ | GENERIC_WRITE
+            0x00000001,  # FILE_SHARE_READ only
+            None,
+            3,  # OPEN_EXISTING
+            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        if handle is None or handle == wintypes.HANDLE(-1).value:
+            error = ctypes.get_last_error()
+            raise OSError(error, "new_rules.txt is busy or cannot be opened", str(path))
+        fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+        return os.fdopen(fd, "r+b")
+
+    import fcntl
+
+    stream = path.open("r+b")
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        stream.close()
+        raise
+    return stream
+
+
+def clear_new_rules_if_unchanged(path: Path, expected: bytes) -> bool:
+    """Clear the queue only if its exact snapshot is still present and writable."""
+    if not expected:
+        try:
+            return path.read_bytes() == b""
+        except OSError:
+            return False
+    try:
+        stream = _open_exclusive_file(path)
+    except OSError:
+        return False
+    with stream:
+        stream.seek(0)
+        if stream.read() != expected:
+            return False
+        if os.name != "nt":
+            try:
+                current = path.stat()
+                opened = os.fstat(stream.fileno())
+            except OSError:
+                return False
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                return False
+        stream.seek(0)
+        stream.truncate(0)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return True
 
 
 def _contains_conditional_directives(rules: list[str]) -> bool:
@@ -235,15 +330,23 @@ def update_rule_files(
     urls: list[str],
     fetch=fetch_source,
 ) -> list[str]:
-    original_user_rules = read_local_rules(user_rules_path)
-    new_rules = read_local_rules(new_rules_path, allow_empty=True)
+    original_user_rules, user_rules_snapshot = _read_rules_snapshot(user_rules_path)
+    new_rules, new_rules_snapshot = _read_rules_snapshot(new_rules_path, allow_empty=True)
     updated_user_rules = merge_user_rules(original_user_rules, new_rules)
     # Fetch and validate every subscription before touching either persistent
     # output, so a source failure cannot partially apply the pending additions.
     merged = merge_sources(urls, fetch=fetch, local_rules=updated_user_rules)
+    _ensure_unchanged(user_rules_path, user_rules_snapshot)
+    _ensure_unchanged(new_rules_path, new_rules_snapshot)
     if updated_user_rules != original_user_rules:
+        _ensure_unchanged(user_rules_path, user_rules_snapshot)
         atomic_write(user_rules_path, updated_user_rules)
     atomic_write(output_path, merged)
+    if not clear_new_rules_if_unchanged(new_rules_path, new_rules_snapshot):
+        raise RuntimeError(
+            "new_rules.txt changed or is busy after output generation; "
+            "the input was preserved for a safe retry"
+        )
     return merged
 
 
