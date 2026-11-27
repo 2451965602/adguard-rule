@@ -133,15 +133,34 @@ def fetch_source(url: str) -> list[str]:
     return rules
 
 
-def merge_sources(urls: list[str], fetch=fetch_source) -> list[str]:
+def read_local_rules(path: Path) -> list[str]:
+    try:
+        rules = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read local rules file {path}: {exc}") from exc
+    if not rules or not any(line.strip() for line in rules):
+        raise ValueError(f"Local rules file is empty: {path}")
+    if any("\n" in line or "\r" in line for line in rules):
+        raise ValueError(f"Local rules file contains multiline entries: {path}")
+    validate_filter_lines(rules)
+    return rules
+
+
+def merge_sources(
+    urls: list[str],
+    fetch=fetch_source,
+    local_rules: list[str] | None = None,
+) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
     failures: list[str] = []
-    for url in urls:
+    sources = [("user_rules.txt", local_rules or [])]
+    sources.extend((url, None) for url in urls)
+    for label, rules in sources:
         try:
-            source_rules = fetch(url)
+            source_rules = rules if rules is not None else fetch(label)
         except Exception as exc:
-            failures.append(f"{url}: {exc}")
+            failures.append(f"{label}: {exc}")
             continue
         # Conditional blocks are source-scoped. Keep their contents untouched,
         # including duplicates, rather than deduplicating across scopes.
@@ -187,9 +206,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--user-rules", type=Path, default=ROOT / "user_rules.txt")
     args = parser.parse_args()
     try:
-        rules = merge_sources(read_sources(args.sources))
+        local_rules = read_local_rules(args.user_rules)
+        rules = merge_sources(read_sources(args.sources), local_rules=local_rules)
         atomic_write(args.output, rules)
     except Exception as exc:
         parser.exit(1, f"error: {exc}\n")

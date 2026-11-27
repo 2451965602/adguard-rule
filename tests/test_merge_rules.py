@@ -56,6 +56,31 @@ class MergeRulesTests(unittest.TestCase):
              "!#if B", "||same.example^", "!#endif"],
         )
 
+    def test_user_rules_are_kept_first_and_exact_duplicates_removed(self):
+        user_rules = [
+            "# user exception",
+            "@@||allow.example^$important",
+            "||block.example^$important",
+        ]
+        feed = [
+            "@@||allow.example^$important",
+            "||block.example^$important",
+            "||feed-only.example^",
+        ]
+        self.assertEqual(
+            merge_rules.merge_sources(
+                ["feed"], {"feed": feed}.__getitem__, local_rules=user_rules
+            ),
+            user_rules + ["||feed-only.example^"],
+        )
+
+    def test_reads_local_rule_file_without_rewriting_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "user_rules.txt"
+            expected = ["# marker", "@@||allowed.example^$important", "||blocked.example^"]
+            path.write_text("\n".join(expected) + "\n", encoding="utf-8")
+            self.assertEqual(merge_rules.read_local_rules(path), expected)
+
     def test_rejects_unbalanced_conditionals_and_source_relative_includes(self):
         for rules in (["!#if A", "||example.com^"], ["!#include fragments/extra.txt"]):
             with self.subTest(rules=rules), self.assertRaises(ValueError):
